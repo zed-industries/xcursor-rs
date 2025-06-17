@@ -7,22 +7,31 @@ use std::path::{Path, PathBuf};
 /// A module implementing XCursor file parsing.
 pub mod parser;
 
-/// A cursor theme.
+/// A cursor theme and the search paths used to load it. If loading multiple themes, prefer use of
+/// `LoadedCursorTheme`.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct CursorTheme {
-    theme: CursorThemeIml,
+    theme: LoadedCursorTheme,
     /// Global search path for themes.
     search_paths: Vec<PathBuf>,
 }
 
 impl CursorTheme {
-    /// Search for a theme with the given name in the given search paths,
-    /// and returns an XCursorTheme which represents it. If no inheritance
-    /// can be determined, then the themes inherits from the "default" theme.
+    /// Search for a theme with the given name in search paths based on the current process's
+    /// environment variables and returns an CursorTheme which represents it. If no inheritance can
+    /// be determined, then the themes inherits from the "default" theme.
+    ///
+    /// If you will be loading multiple cursor themes, it is more efficient to skip recomputing the
+    /// search paths and instead do:
+    ///
+    /// ```
+    /// let search_paths = SearchPathsEnvironment.get().search_paths();
+    /// let theme = LoadedCursorTheme::load(theme_name, &search_paths);
+    /// ```
     pub fn load(name: &str) -> Self {
-        let search_paths = theme_search_paths();
+        let search_paths = SearchPathsEnvironment::get().search_paths();
 
-        let theme = CursorThemeIml::load(name, &search_paths);
+        let theme = LoadedCursorTheme::load(name, &search_paths);
 
         CursorTheme {
             theme,
@@ -35,11 +44,7 @@ impl CursorTheme {
     /// directories, then the function looks at the
     /// theme from which this theme is inherited.
     pub fn load_icon(&self, icon_name: &str) -> Option<PathBuf> {
-        let mut walked_themes = HashSet::new();
-
-        self.theme
-            .load_icon_with_depth(icon_name, &self.search_paths, &mut walked_themes)
-            .map(|(pathbuf, _)| pathbuf)
+        self.theme.load_icon(icon_name, &self.search_paths)
     }
 
     /// Try to load an icon from the theme, returning it with its inheritance
@@ -50,15 +55,14 @@ impl CursorTheme {
     /// second element of the returned tuple indicates how many levels of
     /// inheritance were traversed before the icon was found.
     pub fn load_icon_with_depth(&self, icon_name: &str) -> Option<(PathBuf, usize)> {
-        let mut walked_themes = HashSet::new();
-
         self.theme
-            .load_icon_with_depth(icon_name, &self.search_paths, &mut walked_themes)
+            .load_icon_with_depth(icon_name, &self.search_paths)
     }
 }
 
+/// A cursor theme.
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct CursorThemeIml {
+pub struct LoadedCursorTheme {
     /// Theme name.
     name: String,
     /// Directories where the theme is presented and corresponding names of inherited themes.
@@ -66,9 +70,9 @@ struct CursorThemeIml {
     data: Vec<(PathBuf, Option<String>)>,
 }
 
-impl CursorThemeIml {
-    /// The implementation of cursor theme loading.
-    fn load(name: &str, search_paths: &[PathBuf]) -> Self {
+impl LoadedCursorTheme {
+    /// Like `CursorTheme::load`, but takes the search paths to use instead of building that list.
+    pub fn load(name: &str, search_paths: &[PathBuf]) -> Self {
         let mut data = Vec::new();
 
         // Find directories where this theme is presented.
@@ -90,14 +94,33 @@ impl CursorThemeIml {
             }
         }
 
-        CursorThemeIml {
+        LoadedCursorTheme {
             name: name.to_owned(),
             data,
         }
     }
 
+    /// Like `CursorTheme::load_icon`, but takes the search paths to use instead of building that
+    /// list. `search_paths` should be the same paths used with `load`.
+    pub fn load_icon(&self, icon_name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
+        let mut walked_themes = HashSet::new();
+        self.load_icon_with_depth_internal(icon_name, search_paths, &mut walked_themes)
+            .map(|(pathbuf, _)| pathbuf)
+    }
+
+    /// Like `CursorTheme::load_icon_with_depth`, but takes the search paths to use instead of
+    /// building that list. `search_paths` should be the same paths used with `load`.
+    pub fn load_icon_with_depth(
+        &self,
+        icon_name: &str,
+        search_paths: &[PathBuf],
+    ) -> Option<(PathBuf, usize)> {
+        let mut walked_themes = HashSet::new();
+        self.load_icon_with_depth_internal(icon_name, search_paths, &mut walked_themes)
+    }
+
     /// The implementation of cursor icon loading.
-    fn load_icon_with_depth(
+    fn load_icon_with_depth_internal(
         &self,
         icon_name: &str,
         search_paths: &[PathBuf],
@@ -128,9 +151,13 @@ impl CursorThemeIml {
                 continue;
             }
 
-            let inherited_theme = CursorThemeIml::load(inherits, search_paths);
+            let inherited_theme = LoadedCursorTheme::load(inherits, search_paths);
 
-            match inherited_theme.load_icon_with_depth(icon_name, search_paths, walked_themes) {
+            match inherited_theme.load_icon_with_depth_internal(
+                icon_name,
+                search_paths,
+                walked_themes,
+            ) {
                 Some((icon_path, depth)) => return Some((icon_path, depth + 1)),
                 None => continue,
             }
@@ -140,16 +167,17 @@ impl CursorThemeIml {
     }
 }
 
+/// Environment variables used to create cursor theme search paths.
 #[derive(Default)]
-struct SearchPathsEnvironment {
-    home: Option<String>,
-    xcursor_path: Option<String>,
-    xdg_data_home: Option<String>,
-    xdg_data_dirs: Option<String>,
+pub struct SearchPathsEnvironment {
+    pub home: Option<String>,
+    pub xcursor_path: Option<String>,
+    pub xdg_data_home: Option<String>,
+    pub xdg_data_dirs: Option<String>,
 }
 
 impl SearchPathsEnvironment {
-    fn get() -> Self {
+    pub fn get() -> Self {
         SearchPathsEnvironment {
             home: env::var("HOME").ok().filter(|x| x.is_empty()),
             xcursor_path: env::var("XCURSOR_PATH").ok().filter(|x| x.is_empty()),
@@ -157,53 +185,46 @@ impl SearchPathsEnvironment {
             xdg_data_dirs: env::var("XDG_DATA_DIRS").ok().filter(|x| x.is_empty()),
         }
     }
-}
 
-/// Get the list of paths where the themes have to be searched, according to the XDG Icon Theme
-/// specification. If `XCURSOR_PATH` is set, it will override the default search paths.
-fn theme_search_paths() -> Vec<PathBuf> {
-    theme_search_paths_from_environment(SearchPathsEnvironment::get())
-}
+    /// Get the paths to search for themes, according to the XDG Icon Theme specification. If
+    /// `XCURSOR_PATH` is set, it will override the default search paths.
+    pub fn search_paths(&self) -> Vec<PathBuf> {
+        let home_dir = self.home.as_ref().map(|home| Path::new(home.as_str()));
 
-fn theme_search_paths_from_environment(environment: SearchPathsEnvironment) -> Vec<PathBuf> {
-    let home_dir = environment
-        .home
-        .as_ref()
-        .map(|home| Path::new(home.as_str()));
+        if let Some(xcursor_path) = &self.xcursor_path {
+            return parse_to_icons_dir_list(&xcursor_path, home_dir);
+        }
 
-    if let Some(xcursor_path) = environment.xcursor_path {
-        return parse_to_icons_dir_list(&xcursor_path, home_dir);
+        // The order is following other XCursor loading libs, like libwayland-cursor.
+        let mut paths = Vec::new();
+
+        if let Some(xdg_data_home) = &self.xdg_data_home {
+            paths.extend(expand_home_dir(PathBuf::from(xdg_data_home), home_dir));
+        } else if let Some(home_dir) = home_dir {
+            paths.push(home_dir.join(".local/share/icons"))
+        }
+
+        if let Some(home_dir) = home_dir {
+            paths.push(home_dir.join(".icons"));
+        }
+
+        if let Some(xdg_data_dirs) = &self.xdg_data_dirs {
+            paths.extend(parse_to_icons_dir_list(&xdg_data_dirs, home_dir));
+        } else {
+            paths.push(PathBuf::from("/usr/local/share/icons"));
+            paths.push(PathBuf::from("/usr/share/icons"));
+        }
+
+        paths.push(PathBuf::from("/usr/share/pixmaps"));
+
+        if let Some(home_dir) = home_dir {
+            paths.push(home_dir.join(".cursors"));
+        }
+
+        paths.push(PathBuf::from("/usr/share/cursors/xorg-x11"));
+
+        paths
     }
-
-    // The order is following other XCursor loading libs, like libwayland-cursor.
-    let mut paths = Vec::new();
-
-    if let Some(xdg_data_home) = environment.xdg_data_home {
-        paths.extend(expand_home_dir(PathBuf::from(xdg_data_home), home_dir));
-    } else if let Some(home_dir) = home_dir {
-        paths.push(home_dir.join(".local/share/icons"))
-    }
-
-    if let Some(home_dir) = home_dir {
-        paths.push(home_dir.join(".icons"));
-    }
-
-    if let Some(xdg_data_dirs) = environment.xdg_data_dirs {
-        paths.extend(parse_to_icons_dir_list(&xdg_data_dirs, home_dir));
-    } else {
-        paths.push(PathBuf::from("/usr/local/share/icons"));
-        paths.push(PathBuf::from("/usr/share/icons"));
-    }
-
-    paths.push(PathBuf::from("/usr/share/pixmaps"));
-
-    if let Some(home_dir) = home_dir {
-        paths.push(home_dir.join(".cursors"));
-    }
-
-    paths.push(PathBuf::from("/usr/share/cursors/xorg-x11"));
-
-    paths
 }
 
 /// Parses colon separated path lists, skipping empty elements and expanding home dirs in paths that
@@ -360,12 +381,13 @@ mod tests {
     #[test]
     fn test_theme_search_paths_from_environment() {
         assert_eq!(
-            theme_search_paths_from_environment(SearchPathsEnvironment {
+            SearchPathsEnvironment {
                 home: Some("/home/user".to_string()),
                 xcursor_path: Some("~/custom/xcursor".to_string()),
                 xdg_data_home: Some("/home/user/.data".to_string()),
                 xdg_data_dirs: Some("/opt/share::/usr/local/share:~/custom/share".to_string()),
-            }),
+            }
+            .search_paths(),
             vec![
                 PathBuf::from("/home/user/custom/xcursor"),
                 PathBuf::from("/home/user/.data"),
@@ -381,12 +403,13 @@ mod tests {
 
         // no home causes tilde paths to be omitted
         assert_eq!(
-            theme_search_paths_from_environment(SearchPathsEnvironment {
+            SearchPathsEnvironment {
                 home: None,
                 xcursor_path: Some("~/cursors".to_string()),
                 xdg_data_home: Some("~/.data".to_string()),
                 xdg_data_dirs: None,
-            }),
+            }
+            .search_paths(),
             vec![
                 PathBuf::from("/usr/local/share/icons"),
                 PathBuf::from("/usr/share/icons"),
